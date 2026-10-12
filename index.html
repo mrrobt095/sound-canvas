@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>声音画板</title>
+<style>
+  :root {
+    --bg: #0f1020;
+    --panel: rgba(25, 27, 52, 0.88);
+    --text: #e8e8f5;
+    --muted: #8b8db3;
+    --accent: #7c83ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Microsoft YaHei", sans-serif; }
+  canvas { display: block; touch-action: none; cursor: crosshair; }
+
+  #toolbar {
+    position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%);
+    display: flex; gap: 14px; align-items: center; flex-wrap: wrap; justify-content: center;
+    padding: 10px 16px; border-radius: 16px; background: var(--panel);
+    backdrop-filter: blur(8px); box-shadow: 0 8px 30px rgba(0,0,0,.4);
+    max-width: calc(100vw - 32px);
+  }
+  .group { display: flex; gap: 8px; align-items: center; }
+  .sep { width: 1px; height: 28px; background: rgba(255,255,255,.12); }
+
+  .brush {
+    width: 34px; height: 34px; border-radius: 50%; border: 3px solid transparent;
+    cursor: pointer; position: relative; transition: transform .15s;
+  }
+  .brush:hover { transform: scale(1.1); }
+  .brush.active { border-color: #fff; transform: scale(1.15); }
+  .brush span {
+    position: absolute; bottom: -20px; left: 50%; transform: translateX(-50%);
+    font-size: 11px; color: var(--muted); white-space: nowrap; pointer-events: none;
+  }
+  .brush.active span { color: var(--text); }
+
+  button.btn {
+    background: rgba(255,255,255,.08); color: var(--text); border: 0; border-radius: 10px;
+    padding: 8px 14px; font-size: 14px; cursor: pointer; transition: background .15s;
+  }
+  button.btn:hover { background: rgba(255,255,255,.16); }
+  button.btn.primary { background: var(--accent); color: #fff; min-width: 84px; }
+  button.btn.primary:hover { filter: brightness(1.1); }
+
+  label.tempo { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  input[type=range] { width: 90px; accent-color: var(--accent); }
+
+  #hint {
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -60%);
+    text-align: center; pointer-events: none; transition: opacity .6s;
+  }
+  #hint h1 { font-size: 34px; margin: 0 0 10px; font-weight: 600; letter-spacing: 2px; }
+  #hint p { margin: 4px 0; color: var(--muted); font-size: 15px; }
+  #hint.hidden { opacity: 0; }
+
+  #keys { position: fixed; top: 12px; right: 16px; font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="hint">
+  <h1>🎨 声音画板</h1>
+  <p>在任意位置画线，越高音调越高</p>
+  <p>不同颜色是不同乐器，按 <b>▶ 播放</b> 听听你的画</p>
+</div>
+
+<div id="keys">空格 播放/暂停 · Ctrl+Z 撤销 · 1-5 切换画笔</div>
+
+<div id="toolbar">
+  <div class="group" id="brushes"></div>
+  <div class="sep"></div>
+  <div class="group">
+    <button class="btn primary" id="play">▶ 播放</button>
+    <label class="tempo">速度 <input type="range" id="bpm" min="60" max="200" value="110"></label>
+  </div>
+  <div class="sep"></div>
+  <div class="group">
+    <button class="btn" id="undo">↶ 撤销</button>
+    <button class="btn" id="random">✨ 随机</button>
+    <button class="btn" id="clear">🗑 清空</button>
+  </div>
+</div>
+
+<script>
+// ---------- 配置 ----------
+const BRUSHES = [
+  { name: '柔和', color: '#ff6b8b', wave: 'sine' },
+  { name: '清亮', color: '#ffd166', wave: 'triangle' },
+  { name: '8-bit', color: '#4ecdc4', wave: 'square' },
+  { name: '锐利', color: '#a78bfa', wave: 'sawtooth' },
+  { name: '鼓点', color: '#f1f1f1', wave: 'noise' },
+];
+const STEPS = 32;                         // 一轮横向分成 32 拍
+const SCALE = [0, 3, 5, 7, 10];           // A 小调五声音阶，怎么画都好听
+const ROWS = SCALE.length * 3 + 1;        // 三个八度 + 顶音
+const BASE_FREQ = 110;                    // A2
+
+const rowFreq = row => {
+  const oct = Math.floor(row / SCALE.length);
+  const semi = oct * 12 + SCALE[row % SCALE.length];
+  return BASE_FREQ * Math.pow(2, semi / 12);
+};
+const yToRow = ny => Math.max(0, Math.min(ROWS - 1, Math.floor((1 - ny) * ROWS)));
+
+// ---------- 状态 ----------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, dpr = 1;
+let strokes = [];          // { brush, points: [{x, y}] }，坐标是 0..1 归一化的
+let current = null;
+let brushIdx = 0;
+let playing = false, playStart = 0, lastStep = -1;
+let schedule = null;       // step -> [{row, brush, x, y}]
+let ripples = [];
+
+// ---------- 音频 ----------
+let actx = null, master = null, noiseBuf = null;
+function initAudio() {
+  if (actx) { if (actx.state === 'suspended') actx.resume(); return; }
+  actx = new (window.AudioContext || window.webkitAudioContext)();
+  master = actx.createGain();
+  master.gain.value = 0.5;
+
+  // 简单回声，让声音更有空间感
+  const delay = actx.createDelay();
+  delay.delayTime.value = 0.27;
+  const fb = actx.createGain(); fb.gain.value = 0.32;
+  const wet = actx.createGain(); wet.gain.value = 0.28;
+  master.connect(actx.destination);
+  master.connect(delay); delay.connect(fb); fb.connect(delay);
+  delay.connect(wet); wet.connect(actx.destination);
+
+  noiseBuf = actx.createBuffer(1, actx.sampleRate * 0.3, actx.sampleRate);
+  const d = noiseBuf.getChannelData(0);
+  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+}
+
+function playNote(row, brush, when = 0, dur = 0.45) {
+  if (!actx) return;
+  const t = actx.currentTime + when;
+  const g = actx.createGain();
+  g.connect(master);
+
+  if (brush.wave === 'noise') {
+    const src = actx.createBufferSource();
+    src.buffer = noiseBuf;
+    const f = actx.createBiquadFilter();
+    f.type = 'bandpass';
+    f.frequency.value = 200 + row * 260;  // 高处是镲片，低处是鼓
+    f.Q.value = 1.2;
+    src.connect(f); f.connect(g);
+    g.gain.setValueAtTime(0.9, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + 0.18);
+    src.start(t); src.stop(t + 0.25);
+    return;
+  }
+
+  const osc = actx.createOscillator();
+  osc.type = brush.wave;
+  osc.frequency.value = rowFreq(row);
+  const loud = { sine: 0.35, triangle: 0.35, square: 0.12, sawtooth: 0.12 }[brush.wave];
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(loud, t + 0.012);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  osc.connect(g);
+  osc.start(t); osc.stop(t + dur + 0.05);
+}
+
+// ---------- 画布 ----------
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+function buildSchedule() {
+  // 每条笔画在每一拍里取一个音（该拍内点的平均高度）
+  schedule = Array.from({ length: STEPS }, () => []);
+  for (const s of strokes) {
+    const buckets = new Map();
+    for (const p of s.points) {
+      const step = Math.min(STEPS - 1, Math.floor(p.x * STEPS));
+      if (!buckets.has(step)) buckets.set(step, { sy: 0, n: 0 });
+      const b = buckets.get(step); b.sy += p.y; b.n++;
+    }
+    for (const [step, b] of buckets) {
+      const y = b.sy / b.n;
+      const row = yToRow(y);
+      const dup = schedule[step].some(e => e.row === row && e.brush === s.brush);
+      if (!dup) schedule[step].push({ row, brush: s.brush, x: (step + 0.5) / STEPS, y });
+    }
+  }
+}
+
+function stepDuration() {
+  return 60 / Number(document.getElementById('bpm').value) / 2;  // 八分音符
+}
+
+// ---------- 输入 ----------
+let lastLiveRow = -1;
+canvas.addEventListener('pointerdown', e => {
+  initAudio();
+  canvas.setPointerCapture(e.pointerId);
+  current = { brush: BRUSHES[brushIdx], points: [] };
+  strokes.push(current);
+  lastLiveRow = -1;
+  addPoint(e);
+  document.getElementById('hint').classList.add('hidden');
+});
+canvas.addEventListener('pointermove', e => { if (current) addPoint(e); });
+const endStroke = () => {
+  if (!current) return;
+  if (current.points.length === 0) strokes.pop();
+  current = null;
+  buildSchedule();
+};
+canvas.addEventListener('pointerup', endStroke);
+canvas.addEventListener('pointercancel', endStroke);
+
+function addPoint(e) {
+  const p = { x: e.clientX / W, y: e.clientY / H };
+  current.points.push(p);
+  const row = yToRow(p.y);
+  if (row !== lastLiveRow) {           // 画的时候，音高一变就实时响一下
+    lastLiveRow = row;
+    playNote(row, current.brush, 0, 0.25);
+  }
+}
+
+// ---------- 控件 ----------
+const brushBox = document.getElementById('brushes');
+BRUSHES.forEach((b, i) => {
+  const el = document.createElement('div');
+  el.className = 'brush' + (i === 0 ? ' active' : '');
+  el.style.background = b.color;
+  el.style.boxShadow = `0 0 12px ${b.color}88`;
+  el.innerHTML = `<span>${b.name}</span>`;
+  el.onclick = () => selectBrush(i);
+  brushBox.appendChild(el);
+});
+function selectBrush(i) {
+  brushIdx = i;
+  [...brushBox.children].forEach((el, j) => el.classList.toggle('active', j === i));
+  initAudio();
+  playNote(9, BRUSHES[i], 0, 0.3);   // 预览一下音色
+}
+
+const playBtn = document.getElementById('play');
+function togglePlay() {
+  initAudio();
+  playing = !playing;
+  if (playing) {
+    buildSchedule();
+    playStart = performance.now();
+    lastStep = -1;
+  }
+  playBtn.textContent = playing ? '⏸ 暂停' : '▶ 播放';
+}
+playBtn.onclick = togglePlay;
+
+// 改速度时保持播放头位置不跳
+let prevStepDur = stepDuration();
+document.getElementById('bpm').addEventListener('input', () => {
+  const now = performance.now();
+  const pos = (now - playStart) / 1000 / prevStepDur;
+  prevStepDur = stepDuration();
+  playStart = now - pos * prevStepDur * 1000;
+});
+
+function undo() { strokes.pop(); buildSchedule(); }
+document.getElementById('undo').onclick = undo;
+document.getElementById('clear').onclick = () => { strokes = []; ripples = []; buildSchedule(); };
+
+document.getElementById('random').onclick = () => {
+  initAudio();
+  document.getElementById('hint').classList.add('hidden');
+  const n = 2 + Math.floor(Math.random() * 3);
+  for (let k = 0; k < n; k++) {
+    const brush = BRUSHES[Math.floor(Math.random() * BRUSHES.length)];
+    const pts = [];
+    const x0 = Math.random() * 0.3, x1 = 0.7 + Math.random() * 0.3;
+    const cy = 0.15 + Math.random() * 0.6, amp = 0.05 + Math.random() * 0.2;
+    const freq = 1 + Math.random() * 4, phase = Math.random() * 6.28;
+    for (let x = x0; x <= x1; x += 0.004) {
+      pts.push({ x, y: cy + Math.sin(x * freq * 6.28 + phase) * amp });
+    }
+    strokes.push({ brush, points: pts });
+  }
+  buildSchedule();
+  if (!playing) togglePlay();
+};
+
+window.addEventListener('keydown', e => {
+  if (e.code === 'Space') { e.preventDefault(); togglePlay(); }
+  else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') { e.preventDefault(); undo(); }
+  else if (e.key >= '1' && e.key <= String(BRUSHES.length)) selectBrush(Number(e.key) - 1);
+});
+
+// ---------- 渲染循环 ----------
+function frame(now) {
+  ctx.clearRect(0, 0, W, H);
+
+  // 音高条纹
+  for (let r = 0; r < ROWS; r++) {
+    const y0 = H - (r + 1) * H / ROWS;
+    if (r % SCALE.length === 0) {
+      ctx.fillStyle = 'rgba(124,131,255,0.06)';
+      ctx.fillRect(0, y0, W, H / ROWS);
+    } else if (r % 2) {
+      ctx.fillStyle = 'rgba(255,255,255,0.018)';
+      ctx.fillRect(0, y0, W, H / ROWS);
+    }
+  }
+  // 节拍竖线
+  for (let s = 0; s <= STEPS; s++) {
+    ctx.strokeStyle = s % 4 === 0 ? 'rgba(255,255,255,0.07)' : 'rgba(255,255,255,0.025)';
+    ctx.beginPath(); ctx.moveTo(s * W / STEPS, 0); ctx.lineTo(s * W / STEPS, H); ctx.stroke();
+  }
+
+  // 播放与触发
+  let headX = -1;
+  if (playing) {
+    const sd = stepDuration();
+    const pos = (now - playStart) / 1000 / sd;
+    const step = Math.floor(pos) % STEPS;
+    headX = ((pos % STEPS) / STEPS) * W;
+    if (step !== lastStep) {
+      lastStep = step;
+      for (const ev of schedule[step] || []) {
+        playNote(ev.row, ev.brush, 0, Math.max(0.25, sd * 2.2));
+        ripples.push({ x: ev.x * W, y: ev.y * H, t: now, color: ev.brush.color });
+      }
+    }
+  }
+
+  // 笔画
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for (const s of strokes) {
+    if (s.points.length === 0) continue;
+    ctx.strokeStyle = s.brush.color;
+    ctx.shadowColor = s.brush.color;
+    ctx.shadowBlur = 14;
+    ctx.lineWidth = 5;
+    ctx.beginPath();
+    s.points.forEach((p, i) => i ? ctx.lineTo(p.x * W, p.y * H) : ctx.moveTo(p.x * W, p.y * H));
+    if (s.points.length === 1) ctx.lineTo(s.points[0].x * W + 0.1, s.points[0].y * H);
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+
+  // 涟漪
+  ripples = ripples.filter(r => now - r.t < 700);
+  for (const r of ripples) {
+    const k = (now - r.t) / 700;
+    ctx.strokeStyle = r.color;
+    ctx.globalAlpha = 1 - k;
+    ctx.lineWidth = 3 * (1 - k) + 0.5;
+    ctx.beginPath(); ctx.arc(r.x, r.y, 6 + k * 40, 0, Math.PI * 2); ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+
+  // 播放头
+  if (headX >= 0) {
+    const g = ctx.createLinearGradient(headX - 30, 0, headX, 0);
+    g.addColorStop(0, 'rgba(124,131,255,0)');
+    g.addColorStop(1, 'rgba(124,131,255,0.25)');
+    ctx.fillStyle = g;
+    ctx.fillRect(headX - 30, 0, 30, H);
+    ctx.fillStyle = '#b6baff';
+    ctx.fillRect(headX - 1, 0, 2, H);
+  }
+
+  requestAnimationFrame(frame);
+}
+buildSchedule();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
